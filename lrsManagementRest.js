@@ -7,6 +7,26 @@ var http   = require('http');
 var events = require('events');
 var util   = require('util');
 
+// unix domain socket name to connect to local REST server
+var unixSockName = "/tmp/rest_server/http.sock";
+
+/**
+ * Overwrites obj1's values with obj2's and adds obj2's if non existent in obj1
+ * @param obj1
+ * @param obj2
+ * @returns obj3 a new object based on obj1 and obj2
+ */
+function mergeOptions(obj1, obj2){
+  var obj3 = {};
+  Object.getOwnPropertyNames(obj1).forEach(function(attrname) {
+    obj3[attrname] = obj1[attrname];
+  });
+  Object.getOwnPropertyNames(obj2).forEach(function(attrname) {
+    obj3[attrname] = obj2[attrname];
+  });
+  return obj3;
+}
+
 // [Event EmitterObjects]
 // Local REST API Client Object:
 // REST client functions will be called more often than
@@ -46,15 +66,30 @@ var ClientTemplate = {
             var data = "username="+username+"&password="+password;
             // Set local options:
             var localOptions = {
-                    host          : safeOpts.host        || '127.0.0.1',
-                    port          : safeOpts.port        || 3001,
                     path          : safeOpts.path        || '/login',
                     contentLength : data.length,
                     contentType   : "application/x-www-form-urlencoded"
             };
-            // Save the host/port we logged in to for future calls.
-            self.host = localOptions.host;
-            self.port = localOptions.port;
+            self.connectionOptions = {};
+            if(safeOpts.host || safeOpts.port) {
+              localOptions.host = safeOpts.host || '127.0.0.1';
+              localOptions.port = safeOpts.port || 3001;
+              // Save the host/port we logged in to for future calls.
+              self.connectionOptions.host = localOptions.host;
+              self.connectionOptions.port = localOptions.port;
+            } else {
+              // default to unix-domain socket since we are trying to connect to
+              // the local REST server and shouldn't need to be authorized
+              localOptions.socketPath = unixSockName;
+              // Save the socketName we logged in to for future calls.
+              self.connectionOptions.socketPath = localOptions.socketPath;
+              // No need to explicitly login when using unix-domain sockets.
+              process.nextTick(function() {
+                self.loggedIn = true;
+                self.emit('login');
+              }); 
+              return;
+            }
             // Set Response callback:
             localOptions.callback = function(loginResponse) {
                 var body = "";
@@ -75,7 +110,7 @@ var ClientTemplate = {
                 loginResponse.on('end', checkBody);
             };
             // Create the request:
-            var req = getPostReq(localOptions);
+            var req = getPostReq(localOptions, self.connectionOptions);
             // Set the error callback:
             req.on('error',
                    function(error) {self.emit('loginRequestFailure', error);}
@@ -91,8 +126,6 @@ var ClientTemplate = {
             var safeOpts = options || {};
             // Set local options:
             var localOptions = {
-                    host   : self.host,
-                    port   : self.port,
                     path   : safeOpts.path || '/logout',
                     cookie : self.sid
             };
@@ -102,7 +135,7 @@ var ClientTemplate = {
                     self.emit('logout');
             };
             // Create the request:
-            var req = getGetReq(localOptions);
+            var req = getGetReq(localOptions, self.connectionOptions);
             // Set the error callback:
             req.on('error',
                    function(error) {self.emit('logoutRequestFailure', error);}
@@ -116,14 +149,12 @@ var ClientTemplate = {
             var options = parseOptions(arguments, ['path'], ['callback']);
             // Set local options:
             var localOptions = {
-                    host       : self.host,
-                    port       : self.port,
                     path       : self.apiPrefix + options.path,
                     cookie     : self.sid,
                     callback   : options.callback   || printResponse
             };
             // Create the request:
-            var req = getGetReq(localOptions);
+            var req = getGetReq(localOptions, self.connectionOptions);
             // Set the error callback:
             installErrorProxy(req);
             // Send the Get request:
@@ -140,8 +171,6 @@ var ClientTemplate = {
             var jsonString = toJsonString(options['body']);
             // Set local options:
             var localOptions = {
-                    host          : self.host,
-                    port          : self.port,
                     path          : self.apiPrefix + options.path,
                     contentLength : jsonString.length,
                     contentType   : "application/json",
@@ -149,7 +178,7 @@ var ClientTemplate = {
                     callback      : options.callback    || printResponse
             };
             // Create the request:
-            var req = getPutReq(localOptions);
+            var req = getPutReq(localOptions, self.connectionOptions);
             // Set the error callback:
             installErrorProxy(req);
             // Send the put request:
@@ -167,8 +196,6 @@ var ClientTemplate = {
             var jsonString = toJsonString(options['body']);
             // Set local options:
             var localOptions = {
-                    host          : self.host,
-                    port          : self.port,
                     path          : self.apiPrefix + options.path,
                     contentLength : jsonString.length,
                     contentType   : "application/json",
@@ -176,7 +203,7 @@ var ClientTemplate = {
                     callback      : options.callback     || printResponse
             };
             // Create the request:
-            var req = getPostReq(localOptions);
+            var req = getPostReq(localOptions, self.connectionOptions);
             // Set the error callback:
             installErrorProxy(req);
             // Send the post request:
@@ -190,14 +217,12 @@ var ClientTemplate = {
             var options = parseOptions(arguments, ['path'], ['callback']);
             // Set local options:
             var localOptions = {
-                    host       : self.host,
-                    port       : self.port,
                     path       : self.apiPrefix + options.path,
                     cookie     : self.sid,
                     callback   : options.callback   || printResponse
             };
             // Create the request:
-            var req = getDeleteReq(localOptions);
+            var req = getDeleteReq(localOptions, self.connectionOptions);
             // Set the error callback:
             installErrorProxy(req);
             // Send the delete request:
@@ -243,14 +268,12 @@ util.inherits(Client, events.EventEmitter);
 
 // [Base REST Functions]
 // Post data to the local REST API:
-function getPostReq(options) {
+function getPostReq(options, connectionOptions) {
     // Test for required options:
     testRequiredOptions(options,
-                        ["host","port","path","contentLength","contentType"]);
+                        ["path","contentLength","contentType"]);
     // Create the HTTP request options:
     var requestOptions = {
-        host    : options.host,
-        port    : options.port,
         path    : options.path,
         method  : "POST",
         agent   : false,
@@ -260,6 +283,7 @@ function getPostReq(options) {
             "Content-Type"   : options.contentType
         }
     };
+    requestOptions = mergeOptions(requestOptions, connectionOptions);
     // Add cookies if provided:
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
@@ -269,13 +293,11 @@ function getPostReq(options) {
     return req;
 }
 // Get data from the local REST API:
-function getGetReq(options) {
+function getGetReq(options, connectionOptions) {
     // Test for required options:
-    testRequiredOptions(options, ["host","port","path"]);
+    testRequiredOptions(options, ["path"]);
     // Create the HTTP request options:
     var requestOptions = {
-        host    : options.host,
-        port    : options.port,
         path    : options.path,
         method  : "GET",
         agent   : false,
@@ -283,6 +305,7 @@ function getGetReq(options) {
             Accept : "*/*"
         }
     };
+    requestOptions = mergeOptions(requestOptions, connectionOptions);
     // Add cookies if provided:
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
@@ -292,19 +315,18 @@ function getGetReq(options) {
     return req;
 }
 // Delete data from the local REST API:
-function getDeleteReq(options) {
+function getDeleteReq(options, connectionOptions) {
     // Test for required options:
-    testRequiredOptions(options, ["host","port","path"]);
+    testRequiredOptions(options, ["path"]);
     // Create the HTTP request options:
     var requestOptions = {
-        host    : options.host,
-        port    : options.port,
         path    : options.path,
         method  : "DELETE",
         headers : {
             Accept : "*/*"
         }
     };
+    requestOptions = mergeOptions(requestOptions, connectionOptions);
     // Add cookies if provided:
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
@@ -314,14 +336,12 @@ function getDeleteReq(options) {
     return req;
 }
 // Put data in the local REST API:
-function getPutReq(options) {
+function getPutReq(options, connectionOptions) {
     // Test for required options:
     testRequiredOptions(options,
-                        ["host","port","path","contentLength","contentType"]);
+                        ["path","contentLength","contentType"]);
     // Create the HTTP request options:
     var requestOptions = {
-        host    : options.host,
-        port    : options.port,
         path    : options.path,
         method  : "PUT",
         headers : {
@@ -330,6 +350,7 @@ function getPutReq(options) {
             "Content-Type"   : options.contentType
         }
     };
+    requestOptions = mergeOptions(requestOptions, connectionOptions);
     // Add cookies if provided:
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
