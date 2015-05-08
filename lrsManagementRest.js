@@ -1,3 +1,8 @@
+// Author: toejough (https://github.com/toejough)
+// Contributors:
+//   adrian (https://github.com/adrian)
+//   mvachhar (https://github.com/mvachhar)
+
 // [Use Strict JS]
 "use strict";
 
