@@ -4,6 +4,7 @@
 //   mvachhar (https://github.com/mvachhar)
 
 // [Use Strict JS]
+/* jslint node: true */
 "use strict";
 
 // [Requires]
@@ -14,6 +15,10 @@ var util   = require('util');
 
 // unix domain socket name to connect to local REST server
 var unixSockName = "/tmp/rest_server/http.sock";
+
+// Check if running in Linerate scripting environment (as opposed to 
+// node.js environment)
+var linerate = process.versions.linerate;
 
 /**
  * Overwrites obj1's values with obj2's and adds obj2's if non existent in obj1
@@ -53,59 +58,62 @@ var ClientTemplate = {
     getBound_logIn: function(self) {
         return function(options) {
             // Get options, even if none given:
+            var localOptions;
+            var req;
             var safeOpts = options || {};
             // Error if username xor password was passed in:
             if (safeOpts.username && !safeOpts.password) {
-                self.emit('error', {message: "Client login options contained the username " +
-                                             " but no password."});
+                self.emit('error', {message: "Client login options " +
+                                             "contained the username but no " +
+                                             "password."});
                 return;
             }
             if (!safeOpts.username && safeOpts.password) {
-                self.emit('error', {message: "Client login options contained the password " +
-                                             " but no username."});
+                self.emit('error', {message: "Client login options " +
+                                             "contained the password but no " +
+                                             "username."});
                 return;
             }
             // Get Username/password (with defaults), build body
             var username = safeOpts.username || "testlab";
             var password = safeOpts.password || "changeme";
             var data = "username="+username+"&password="+password;
-            // Set local options:
-            var localOptions = {
+            self.connectionOptions = {};
+            // If running in linerate scripting environment, always use the
+            // 'host' and 'port' options when making the the HTTP client request
+            // (defaults to localhost:3001).
+            // If not running in linerate scripting environment, use the
+            // 'host' and 'port' options if either is specified when making the
+            // the HTTP client request (defaults to localhost:3001). If neither
+            // 'host' nor 'port' is specified in the non-Linerate case, use the
+            // 'socketPath' option and point the HTTP request to the unix-domain
+            // socket on which the REST server listens on.
+            if(linerate || safeOpts.host || safeOpts.port) {
+              localOptions = {
                     path          : safeOpts.path        || '/login',
                     contentLength : data.length,
-                    contentType   : "application/x-www-form-urlencoded"
-            };
-            self.connectionOptions = {};
-            if(safeOpts.host || safeOpts.port) {
-              localOptions.host = safeOpts.host || '127.0.0.1';
-              localOptions.port = safeOpts.port || 3001;
+                    contentType   : "application/x-www-form-urlencoded",
+                    host          : safeOpts.host || '127.0.0.1',
+                    port          : safeOpts.port || 3001
+              };
               // Save the host/port we logged in to for future calls.
               self.connectionOptions.host = localOptions.host;
               self.connectionOptions.port = localOptions.port;
-            } else {
-              // default to unix-domain socket since we are trying to connect to
-              // the local REST server and shouldn't need to be authorized
-              localOptions.socketPath = unixSockName;
-              // Save the socketName we logged in to for future calls.
-              self.connectionOptions.socketPath = localOptions.socketPath;
-              // No need to explicitly login when using unix-domain sockets.
-              process.nextTick(function() {
-                self.loggedIn = true;
-                self.emit('login');
-              }); 
-              return;
-            }
-            // Set Response callback:
-            localOptions.callback = function(loginResponse) {
+              // Set Response callback:
+              localOptions.callback = function(loginResponse) {
                 var body = "";
                 var checkBody = function() {
                     if (body.indexOf("login") != -1) {
                         self.emit('loginFailure', loginResponse, body);
                     } else {
-			var setCookieHdr = loginResponse.headers['set-cookie'];
-			if(setCookieHdr instanceof Array) {
-			    setCookieHdr = setCookieHdr[0];
-			}
+                        var setCookieHdr = loginResponse.headers['set-cookie'];
+                        if(!setCookieHdr) {
+                          self.emit('loginFailure', loginResponse, body);
+                          return;
+                        }
+                        if(setCookieHdr instanceof Array) {
+                          setCookieHdr = setCookieHdr[0];
+                        }
                         self.sid = setCookieHdr.split('; ')[0];
                         self.loggedIn = true;
                         self.emit('login');
@@ -113,16 +121,59 @@ var ClientTemplate = {
                 };
                 loginResponse.on('data', function(chunk) {body += chunk;});
                 loginResponse.on('end', checkBody);
-            };
-            // Create the request:
-            var req = getPostReq(localOptions, self.connectionOptions);
-            // Set the error callback:
-            req.on('error',
+              };
+              // Create the request:
+              req = getPostReq(localOptions, self.connectionOptions);
+              // Set the error callback:
+              req.on('error',
                    function(error) {self.emit('loginRequestFailure', error);}
-            );
-            // Log in:
-            req.write(data);
-            req.end();
+              );
+              // Log in:
+              req.write(data);
+              req.end();
+            } else {
+              // When using the unix-domain socket option, there is no need to
+              // login. However, we need to check that the client can access
+              // the REST server over the unix-domain socket. This is checked
+              // by doing an HTTP GET on the 'apiPrefix' path.
+              localOptions = {
+                    path          : self.apiPrefix,
+                    socketPath    : unixSockName
+              };
+              // Save the socketName we logged in to for future calls.
+              self.connectionOptions.socketPath = localOptions.socketPath;
+              // Set Response callback:
+              localOptions.callback = function(loginResponse) {
+                var body = "";
+                var checkBody = function() {
+                  if(loginResponse.statusCode != 200) {
+                    self.emit('loginFailure', loginResponse, body);
+                  } else {
+                    var setCookieHdr = loginResponse.headers['set-cookie'];
+                    if(!setCookieHdr) {
+                      self.emit('loginFailure', loginResponse, body);
+                      return;
+                    }
+                    if(setCookieHdr instanceof Array) {
+                      setCookieHdr = setCookieHdr[0];
+                    }
+                    self.sid = setCookieHdr.split('; ')[0];
+                    self.loggedIn = true;
+                    self.emit('login');
+                  }
+                };
+                loginResponse.on('data', function(chunk) {body += chunk;});
+                loginResponse.on('end', checkBody);
+              };
+              // Create the request:
+              req = getGetReq(localOptions, self.connectionOptions);
+              // Set the error callback:
+              req.on('error',
+                   function(error) {self.emit('loginRequestFailure', error);}
+              );
+              // Log in:
+              req.end();
+            }
         };
     },
     getBound_logOut: function(self) {
@@ -173,7 +224,7 @@ var ClientTemplate = {
                                        ['path','body'],
                                        ['callback']);
             // Convert JSON to string:
-            var jsonString = toJsonString(options['body']);
+            var jsonString = toJsonString(options.body);
             // Set local options:
             var localOptions = {
                     path          : self.apiPrefix + options.path,
@@ -198,7 +249,7 @@ var ClientTemplate = {
                                        ['path','body'],
                                        ['callback']);
             // Convert JSON to string:
-            var jsonString = toJsonString(options['body']);
+            var jsonString = toJsonString(options.body);
             // Set local options:
             var localOptions = {
                     path          : self.apiPrefix + options.path,
@@ -247,7 +298,7 @@ var ClientTemplate = {
             self.emit('error', error);
           }
         });
-      }
+      };
     }
 };
 var Client = function() {
@@ -293,8 +344,10 @@ function getPostReq(options, connectionOptions) {
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
     var req = http.request(requestOptions, options.callback);
-    req.removeHeader("Host");
-    req.setHeader("Host", options.host + ":" + options.port);
+    if(!connectionOptions.socketPath) {
+      req.removeHeader("Host");
+      req.setHeader("Host", options.host + ":" + options.port);
+    }
     return req;
 }
 // Get data from the local REST API:
@@ -315,8 +368,10 @@ function getGetReq(options, connectionOptions) {
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
     var req = http.request(requestOptions, options.callback);
-    req.removeHeader("Host");
-    req.setHeader("Host", options.host + ":" + options.port);
+    if(!connectionOptions.socketPath) {
+      req.removeHeader("Host");
+      req.setHeader("Host", options.host + ":" + options.port);
+    }
     return req;
 }
 // Delete data from the local REST API:
@@ -336,8 +391,10 @@ function getDeleteReq(options, connectionOptions) {
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
     var req = http.request(requestOptions, options.callback);
-    req.removeHeader("Host");
-    req.setHeader("Host", options.host + ":" + options.port);
+    if(!connectionOptions.socketPath) {
+      req.removeHeader("Host");
+      req.setHeader("Host", options.host + ":" + options.port);
+    }
     return req;
 }
 // Put data in the local REST API:
@@ -360,8 +417,10 @@ function getPutReq(options, connectionOptions) {
     if (options.cookie) {requestOptions.headers.Cookie = options.cookie;}
     // create standard HTTP request, and return it:
     var req = http.request(requestOptions, options.callback);
-    req.removeHeader("Host");
-    req.setHeader("Host", options.host + ":" + options.port);
+    if(!connectionOptions.socketPath) {
+      req.removeHeader("Host");
+      req.setHeader("Host", options.host + ":" + options.port);
+    }
     return req;
 }
 
@@ -413,19 +472,20 @@ function parseOptions(args, requiredArgs, optionalArgs) {
     }
   }
   var toReturn = {};
+  var i, availOptionalArgs;
   if (isString(args[0])) {
     // In the 'simple' case.
     if (args.length < requiredArgs.length) {
       throw new Error('More arguments required (' + requiredArgs + ')');
     }
-    for(var i = 0; i < requiredArgs.length; ++i) {
+    for(i = 0; i < requiredArgs.length; ++i) {
       toReturn[requiredArgs[i]] = args[i];
     }
 
     // Every arg past requiredArgs.length is an optional arg.
-    var availOptionalArgs = Math.min(args.length - requiredArgs.length,
-                                     optionalArgs.length);
-    for(var i = 0; i < availOptionalArgs; ++i) {
+    availOptionalArgs = Math.min(args.length - requiredArgs.length,
+                                 optionalArgs.length);
+    for(i = 0; i < availOptionalArgs; ++i) {
       toReturn[optionalArgs[i]] = args[requiredArgs.length + i];
     }
   } else {
@@ -436,8 +496,8 @@ function parseOptions(args, requiredArgs, optionalArgs) {
     }
 
     // Every arg past arg[0] (the object specifier) is an optional arg.
-    var availOptionalArgs = Math.min(args.length - 1, optionalArgs.length);
-    for(var i = 0; i < availOptionalArgs; ++i) {
+    availOptionalArgs = Math.min(args.length - 1, optionalArgs.length);
+    for(i = 0; i < availOptionalArgs; ++i) {
       toReturn[optionalArgs[i]] = args[1 + i];
     }
   }
